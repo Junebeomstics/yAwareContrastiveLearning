@@ -36,15 +36,23 @@ class yAwareCLModel:
 
         if hasattr(config, 'pretrained_path') and config.pretrained_path is not None:
             self.load_model(config.pretrained_path)
+            
+        os.makedirs(config.checkpoint_dir, exist_ok=True)    
+        
+        self.st_epoch = 0
+        if config.train_continue == 'on':
+            self.load_checkpoint(config.checkpoint_dir)
 
         self.model = DataParallel(self.model).to(self.device)
 
-    def pretraining(self):
+    def pretraining_yaware(self):
         print(self.loss)
         print(self.optimizer)
-
-        for epoch in range(self.config.nb_epochs):
-
+        
+        
+        for epoch in range(self.st_epoch, self.config.nb_epochs):
+            
+            print("epoch : {}".format(epoch))
             ## Training step
             self.model.train()
             nb_batch = len(self.loader)
@@ -98,7 +106,68 @@ class yAwareCLModel:
                     "optimizer": self.optimizer.state_dict()},
                     os.path.join(self.config.checkpoint_dir, "{name}_epoch_{epoch}.pth".
                                  format(name="y-Aware_Contrastive_MRI", epoch=epoch)))
+                
+    def pretraining_simclr(self):
+        print(self.loss)
+        print(self.optimizer)
+        
+        
+        for epoch in range(self.st_epoch, self.config.nb_epochs):
+            
+            print("epoch : {}".format(epoch))
+            ## Training step
+            self.model.train()
+            nb_batch = len(self.loader)
+            training_loss = 0
+            pbar = tqdm(total=nb_batch, desc="Training")
+            for (inputs, labels) in self.loader:
+                pbar.update()
+                inputs = inputs.to(self.device)
+                labels = labels.to(self.device)
+                self.optimizer.zero_grad()
+                z_i = self.model(inputs[:, 0, :])
+                z_j = self.model(inputs[:, 1, :])
+                batch_loss, logits, target = self.loss(z_i, z_j)
+                batch_loss.backward()
+                self.optimizer.step()
+                training_loss += float(batch_loss) / nb_batch
+            pbar.close()
 
+            ## Validation step
+            nb_batch = len(self.loader_val)
+            pbar = tqdm(total=nb_batch, desc="Validation")
+            val_loss = 0
+            val_values = {}
+            with torch.no_grad():
+                self.model.eval()
+                for (inputs, labels) in self.loader_val:
+                    pbar.update()
+                    inputs = inputs.to(self.device)
+                    labels = labels.to(self.device)
+                    z_i = self.model(inputs[:, 0, :])
+                    z_j = self.model(inputs[:, 1, :])
+                    batch_loss, logits, target = self.loss(z_i, z_j)
+                    val_loss += float(batch_loss) / nb_batch
+                    for name, metric in self.metrics.items():
+                        if name not in val_values:
+                            val_values[name] = 0
+                        val_values[name] += metric(logits, target) / nb_batch
+            pbar.close()
+
+            metrics = "\t".join(["Validation {}: {:.4f}".format(m, v) for (m, v) in val_values.items()])
+            print("Epoch [{}/{}] Training loss = {:.4f}\t Validation loss = {:.4f}\t".format(
+                epoch+1, self.config.nb_epochs, training_loss, val_loss)+metrics, flush=True)
+
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            if (epoch % self.config.nb_epochs_per_saving == 0 or epoch == self.config.nb_epochs - 1) and epoch > 0:
+                torch.save({
+                    "epoch": epoch,
+                    "model": self.model.state_dict(),
+                    "optimizer": self.optimizer.state_dict()},
+                    os.path.join(self.config.checkpoint_dir, "{name}_epoch_{epoch}.pth".
+                                 format(name="y-Aware_Contrastive_MRI", epoch=epoch)))
 
     def fine_tuning(self):
         print(self.loss)
@@ -164,7 +233,24 @@ class yAwareCLModel:
                     self.logger.info('Model loading info: {}'.format(unexpected))
             except BaseException as e:
                 raise ValueError('Error while loading the model\'s weights: %s' % str(e))
+    
+    #developed for train_continue
+    def load_checkpoint(self, ckpt_dir):
+        if not os.path.exists(ckpt_dir) or len(os.listdir(ckpt_dir))==0:
+            self.st_epoch = 0
+            
+        else:
+            ckpt_lst = os.listdir(ckpt_dir)
+            ckpt_lst = [f for f in ckpt_lst if f.endswith('pth')]
+            ckpt_lst.sort(key=lambda f: int(''.join(filter(str.isdigit, f))))  
 
+            # 가장 에포크가 큰 모델을 불러옴
+            dict_model = torch.load('%s/%s' % (ckpt_dir, ckpt_lst[-1]), map_location=device)
+
+            self.model.load_state_dict(dict_model['model'])
+            self.optimizer.load_state_dict(dict_model['optimizer'])
+            self.st_epoch = dict_model['epoch']
+        
 
 
 
