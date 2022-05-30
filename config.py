@@ -4,14 +4,19 @@ FINE_TUNING = 1
 
 class Config:
 
-    def __init__(self, mode, framework):
+    def __init__(self, mode, args):
         assert mode in {PRETRAINING, FINE_TUNING}, "Unknown mode: %i"%mode
 
         self.mode = mode
-        self.framework = framework
+        self.framework = args.framework
+        self.world_size = args.world_size
+        self.rank = args.rank
+        self.dist_backend = args.dist_backend
+        self.local_rank = args.local_rank
+        self.batch_size = args.batch_size
+        self.checkpoint_dir = args.ckpt_dir
 
         if self.mode == PRETRAINING:
-            self.batch_size = 64
             self.nb_epochs_per_saving = 1 # 몇 에포크에 한 번씩 저장할 것인가
             self.pin_mem = True
             self.num_cpu_workers = 8
@@ -37,10 +42,10 @@ class Config:
 #             self.data_val = "/path/to/your/validation/data.npy"
 #             self.label_val = "/path/to/your/validation/metadata.csv"
 
-            self.input_size = (1, 121, 145, 121)
+            self.input_size = (1, 80, 80, 80) #(1, 121, 145, 121)
             self.label_name = "age"
 
-            self.checkpoint_dir = "./checkpoint_simclr"
+            self.checkpoint_dir = args.ckpt_dir
             
             self.train_continue = "on"
 

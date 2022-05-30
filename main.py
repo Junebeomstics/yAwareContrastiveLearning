@@ -1,6 +1,16 @@
 import numpy as np
 from dataset import MRIDataset, UKBDataset
+
+import torch
 from torch.utils.data import DataLoader, Dataset, RandomSampler
+
+#DDP
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn import DataParallel
+import builtins
+
+
 from yAwareContrastiveLearning import yAwareCLModel
 from losses import GeneralizedSupervisedNTXenLoss, NTXenLoss
 from torch.nn import CrossEntropyLoss
@@ -19,23 +29,25 @@ if __name__ == "__main__":
                         help="Set the training mode. Do not forget to configure config.py accordingly !")
     parser.add_argument("--framework", type=str, choices=["yaware", "simclr"], required=True,
                         help="select which framework to use !")
-    
+    parser.add_argument("--ckpt_dir", type=str, default = './checkpoint',
+                        help="select which dir to save the checkpoint!")
     # DDP configs:
-    parser.add_argument('--world-size', default=-1, type=int, 
+    parser.add_argument('--world_size', default=-1, type=int, 
                         help='number of nodes for distributed training')
     parser.add_argument('--rank', default=-1, type=int, 
                         help='node rank for distributed training')
-    parser.add_argument('--dist-url', default='env://', type=str, 
-                        help='url used to set up distributed training')
-    parser.add_argument('--dist-backend', default='nccl', type=str, 
+    parser.add_argument('--dist_backend', default='nccl', type=str, 
                         help='distributed backend')
     parser.add_argument('--local_rank', default=-1, type=int, 
                         help='local rank for distributed training')
+    parser.add_argument('--batch_size', default=64, type=int, 
+                        help='batch_size')
     
     args = parser.parse_args()
     mode = PRETRAINING if args.mode == "pretraining" else FINE_TUNING
 
-    config = Config(mode, args.framework)
+    config = Config(mode, args)
+   
     
     meta_data = pd.read_csv(config.label)
     subjects = os.listdir(config.data)
@@ -55,31 +67,7 @@ if __name__ == "__main__":
     
     subj_train= subj_meta[:num_train]
     subj_val = subj_meta[num_train:]
-
-
-
-    if config.mode == mode:
-        dataset_train = UKBDataset(config, subj_train) #MRIDataset(config, training=True)
-        dataset_val = UKBDataset(config,subj_val)  #MRIDataset(config, validation=True)
-    else:
-        ## Fill with your target dataset
-        dataset_train = Dataset()
-        dataset_val = Dataset()
-
-    loader_train = DataLoader(dataset_train,
-                              batch_size=config.batch_size,
-                              sampler=RandomSampler(dataset_train),
-                              collate_fn=dataset_train.collate_fn,
-                              pin_memory=config.pin_mem,
-                              num_workers=config.num_cpu_workers
-                              )
-    loader_val = DataLoader(dataset_val,
-                            batch_size=config.batch_size,
-                            sampler=RandomSampler(dataset_val),
-                            collate_fn=dataset_val.collate_fn,
-                            pin_memory=config.pin_mem,
-                            num_workers=config.num_cpu_workers
-                            )
+    
     if config.mode == PRETRAINING:
         if config.model == "DenseNet":
             net = densenet121(mode="encoder", drop_rate=0.0)
@@ -94,10 +82,106 @@ if __name__ == "__main__":
             net = UNet(config.num_classes, mode="classif")
         else:
             raise ValueError("Unkown model: %s"%config.model)
+    
+    
+    
+    def _get_sync_file():
+        """Logic for naming sync file using slurm env variables"""
+        sync_file_dir = '%s/pytorch-sync-files' % os.environ['SCRATCH']
+        os.makedirs(sync_file_dir, exist_ok=True)
+        sync_file = 'file://%s/pytorch_sync.%s.%s' % (
+            sync_file_dir, os.environ['SLURM_JOB_ID'], os.environ['SLURM_STEP_ID'])
+        return sync_file
+    
+    ### DDP         
+    # sbatch script에서 WORLD_SIZE를 지정해준 경우 (노드 당 gpu * 노드의 수)
+    if "WORLD_SIZE" in os.environ:
+        config.world_size = int(os.environ["WORLD_SIZE"])
+    # 혹은 슬럼에서 자동으로 ntasks per node * nodes 로 구해줌
+    elif 'SLURM_NTASKS' in os.environ:
+        config.world_size = int(os.environ['SLURM_NTASKS'])
+        
+    config.distributed = config.world_size > 1
+    ngpus_per_node = torch.cuda.device_count()
+
+    if config.distributed:
+        if config.local_rank != -1: # for torch.distributed.launch
+            config.rank = config.local_rank
+            config.gpu = config.local_rank
+        elif 'SLURM_PROCID' in os.environ: # for slurm scheduler
+            config.rank = int(os.environ['SLURM_PROCID'])
+            config.gpu = config.rank % torch.cuda.device_count()
+
+        sync_file = _get_sync_file()
+        dist.init_process_group(backend=config.dist_backend, init_method=sync_file,
+                            world_size=config.world_size, rank=config.rank)
+    else:
+        config.rank = 0
+        config.gpu = 0
+
+    # suppress printing if not on master gpu
+    if config.rank!=0:
+        def print_pass(*args):
+            pass
+        builtins.print = print_pass
+        
+        
+    ### model 
+    if config.distributed:
+        # For multiprocessing distributed, DistributedDataParallel constructor
+        # should always set the single device scope, otherwise,
+        # DistributedDataParallel will use all available devices.
+        if config.gpu is not None:
+            config.device = torch.device('cuda:{}'.format(config.gpu))
+            torch.cuda.set_device(config.gpu)
+            net.cuda(config.gpu)
+            net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[config.gpu], broadcast_buffers=False)
+            net_without_ddp = net.module
+        else:
+            config.device = torch.device("cuda" if config.cuda else "cpu")
+            net.cuda()
+            net = torch.nn.parallel.DistributedDataParallel(net)
+            model_without_ddp = net.module
+    else:
+        config.device = torch.device("cuda" if config.cuda else "cpu")
+        net = DataParallel(net).to(config.device)        
+            
+    torch.backends.cudnn.benchmark = True        
+    
+    if config.mode == mode:
+        dataset_train = UKBDataset(config, subj_train) #MRIDataset(config, training=True)
+        dataset_val = UKBDataset(config,subj_val)  #MRIDataset(config, validation=True)
+    else:
+        ## Fill with your target dataset
+        dataset_train = Dataset()
+        dataset_val = Dataset()
+        
+    if config.distributed:
+        train_sampler = DistributedSampler(dataset_train, shuffle=True)
+        valid_sampler = DistributedSampler(dataset_val, shuffle=True)
+    else:
+        train_sampler = RandomSampler(dataset_train)
+        valid_sampler = RandomSampler(dataset_val)
+        
+
+    loader_train = DataLoader(dataset_train,
+                              batch_size=config.batch_size,
+                              sampler=train_sampler,
+                              collate_fn=dataset_train.collate_fn,
+                              pin_memory=config.pin_mem,
+                              num_workers=config.num_cpu_workers
+                              )
+    loader_val = DataLoader(dataset_val,
+                            batch_size=config.batch_size,
+                            sampler=valid_sampler,
+                            collate_fn=dataset_val.collate_fn,
+                            pin_memory=config.pin_mem,
+                            num_workers=config.num_cpu_workers
+                            )
     if config.mode == PRETRAINING:
         if config.framework == 'simclr':
             loss = NTXenLoss(temperature=config.temperature,return_logits=True)
-        elif confing.framework == 'yaware':
+        elif config.framework == 'yaware':
             loss = GeneralizedSupervisedNTXenLoss(temperature=config.temperature,
                                               kernel='rbf',
                                               sigma=config.sigma,
@@ -111,7 +195,7 @@ if __name__ == "__main__":
     if config.mode == PRETRAINING:
         if config.framework == 'simclr':
             model.pretraining_simclr()
-        elif confing.framework == 'yaware':
+        elif config.framework == 'yaware':
             model.pretraining_yaware()
     else:
         model.fine_tuning()
