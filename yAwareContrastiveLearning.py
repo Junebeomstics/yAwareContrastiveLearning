@@ -3,6 +3,8 @@ import numpy as np
 import torch
 from torch.nn import DataParallel
 import torch.distributed as dist
+from torch.utils.tensorboard import SummaryWriter
+from utils import get_scheduler
 import random
 
 from tqdm import tqdm
@@ -29,7 +31,7 @@ class yAwareCLModel:
         self.loss = loss
         self.model = net
         self.optimizer = torch.optim.Adam(net.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-        self.scheduler = scheduler
+        self.scheduler = get_scheduler(self.optimizer, config)
         self.loader = loader_train
         self.loader_val = loader_val
         if config.cuda and not torch.cuda.is_available():
@@ -44,32 +46,37 @@ class yAwareCLModel:
             self.load_model(config.pretrained_path)
             
         os.makedirs(config.checkpoint_dir, exist_ok=True)    
+        os.makedirs(config.tb_dir, exist_ok=True)
         
         self.st_epoch = 0
         if config.train_continue == 'on':
             self.load_checkpoint(config.checkpoint_dir)
+            
+        self.writer_train = SummaryWriter(log_dir=os.path.join(config.tb_dir, 'train'))
+        self.writer_val = SummaryWriter(log_dir=os.path.join(config.tb_dir, 'val'))
 
 
     def pretraining_yaware(self):
         print(self.loss)
         print(self.optimizer)
         
-
+        pbar = tqdm(total=self.config.nb_epochs, desc="Training")
         for epoch in range(self.st_epoch, self.config.nb_epochs):
             np.random.seed(epoch)
             random.seed(epoch)
             # fix sampling seed such that each gpu gets different part of dataset
             if self.config.distributed:
                 self.loader.sampler.set_epoch(epoch)
-
             print("epoch : {}".format(epoch))
+            pbar.update()
+            
             ## Training step
             self.model.train()
             nb_batch = len(self.loader)
             training_loss = 0
-            pbar = tqdm(total=nb_batch, desc="Training")
+            
             for (inputs, labels) in self.loader:
-                pbar.update()
+                
                 inputs = inputs.to(self.gpu)
                 labels = labels.to(self.gpu)
                 self.optimizer.zero_grad()
@@ -79,7 +86,7 @@ class yAwareCLModel:
                 batch_loss.backward()
                 self.optimizer.step()
                 training_loss += float(batch_loss) / nb_batch
-            pbar.close()
+            
             
             if self.rank == 0:
                 ## Validation step
@@ -90,7 +97,6 @@ class yAwareCLModel:
                 with torch.no_grad():
                     self.model.eval()
                     for (inputs, labels) in self.loader_val:
-                        pbar.update()
                         inputs = inputs.to(self.gpu)
                         labels = labels.to(self.gpu)
                         z_i = self.model(inputs[:, 0, :])
@@ -101,12 +107,15 @@ class yAwareCLModel:
                             if name not in val_values:
                                 val_values[name] = 0
                             val_values[name] += metric(logits, target) / nb_batch
-                pbar.close()
+                
             
                 metrics = "\t".join(["Validation {}: {:.4f}".format(m, v) for (m, v) in val_values.items()])
                 print("Epoch [{}/{}] Training loss = {:.4f}\t Validation loss = {:.4f}\t".format(
                     epoch+1, self.config.nb_epochs, training_loss, val_loss)+metrics) #flush=True
-
+                
+                self.writer_train.add_scalar('training_loss', training_loss, epoch+1)
+                self.writer_val.add_scalar('validation_loss', val_loss, epoch+1)
+                
                 if self.scheduler is not None:
                     self.scheduler.step()
 
@@ -117,26 +126,31 @@ class yAwareCLModel:
                         "optimizer": self.optimizer.state_dict()},
                         os.path.join(self.config.checkpoint_dir, "{name}_epoch_{epoch}.pth".
                                      format(name="y-Aware_Contrastive_MRI", epoch=epoch)))
+            pbar.close()
+        self.writer_train.close()
+        self.writer_val.close()
+
     def pretraining_simclr(self):
         print(self.loss)
         print(self.optimizer)
         
-        
+        pbar = tqdm(total=self.config.nb_epochs, desc="Training")
         for epoch in range(self.st_epoch, self.config.nb_epochs):
             np.random.seed(epoch)
             random.seed(epoch)
             # fix sampling seed such that each gpu gets different part of dataset
             if self.config.distributed:
                 self.loader.sampler.set_epoch(epoch)
-
             print("epoch : {}".format(epoch))
+            pbar.update()
+            
             ## Training step
             self.model.train()
             nb_batch = len(self.loader)
             training_loss = 0
-            pbar = tqdm(total=nb_batch, desc="Training")
+            
             for (inputs, labels) in self.loader:
-                pbar.update()
+                
                 inputs = inputs.to(self.gpu)
                 labels = labels.to(self.gpu)
                 self.optimizer.zero_grad()
@@ -146,7 +160,7 @@ class yAwareCLModel:
                 batch_loss.backward()
                 self.optimizer.step()
                 training_loss += float(batch_loss) / nb_batch
-            pbar.close()
+            
             
             if self.rank == 0:
                 ## Validation step
@@ -157,7 +171,6 @@ class yAwareCLModel:
                 with torch.no_grad():
                     self.model.eval()
                     for (inputs, labels) in self.loader_val:
-                        pbar.update()
                         inputs = inputs.to(self.gpu)
                         labels = labels.to(self.gpu)
                         z_i = self.model(inputs[:, 0, :])
@@ -168,22 +181,29 @@ class yAwareCLModel:
                             if name not in val_values:
                                 val_values[name] = 0
                             val_values[name] += metric(logits, target) / nb_batch
-                pbar.close()
-
+                
+            
                 metrics = "\t".join(["Validation {}: {:.4f}".format(m, v) for (m, v) in val_values.items()])
                 print("Epoch [{}/{}] Training loss = {:.4f}\t Validation loss = {:.4f}\t".format(
-                    epoch+1, self.config.nb_epochs, training_loss, val_loss)+metrics) #flush = True
-
+                    epoch+1, self.config.nb_epochs, training_loss, val_loss)+metrics) #flush=True
+                
+                self.writer_train.add_scalar('training_loss', training_loss, epoch+1)
+                self.writer_val.add_scalar('validation_loss', val_loss, epoch+1)
+                
                 if self.scheduler is not None:
                     self.scheduler.step()
 
-                if (epoch % self.config.nb_epochs_per_saving == 0 or epoch == self.config.nb_epochs - 1) and epoch > 0:
+                if (epoch % self.config.nb_epochs_per_saving == 0 or epoch == self.config.nb_epochs - 1):
                     torch.save({
                         "epoch": epoch,
                         "model": self.model.state_dict(),
                         "optimizer": self.optimizer.state_dict()},
                         os.path.join(self.config.checkpoint_dir, "{name}_epoch_{epoch}.pth".
-                                     format(name="Simclr_Contrastive_MRI", epoch=epoch)))
+                                     format(name="y-Aware_Contrastive_MRI", epoch=epoch)))
+            pbar.close()
+        self.writer_train.close()
+        self.writer_val.close()
+        
 
     def fine_tuning(self):
         print(self.loss)

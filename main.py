@@ -11,13 +11,15 @@ from torch.nn import DataParallel
 import builtins
 
 
+from utils import get_scheduler
+
 from yAwareContrastiveLearning import yAwareCLModel
 from losses import GeneralizedSupervisedNTXenLoss, NTXenLoss
 from torch.nn import CrossEntropyLoss
 from models.densenet import densenet121
 from models.unet import UNet
 import argparse
-from config import Config, PRETRAINING, FINE_TUNING
+from config import Config
 import pandas as pd
 import os
 import random
@@ -31,6 +33,17 @@ if __name__ == "__main__":
                         help="select which framework to use !")
     parser.add_argument("--ckpt_dir", type=str, default = './checkpoint',
                         help="select which dir to save the checkpoint!")
+    parser.add_argument("--tb_dir", type=str, default = './tb',
+                       help="select which dir to save the tensorboard log")
+    parser.add_argument("--tf", type=str, default = 'all_tf',choices=['all_tf','cutout','crop'],
+                       help="select which transforms to apply")
+    parser.add_argument("--label_name", type=str, default = 'age', choices= ['age', 'sex', 'intelligence_gps'], 
+                       help="select which dir to save the tensorboard log")
+    parser.add_argument("--lr_policy",type=str,default='None' ,choices=['lambda','step','multi-step','plateau','cosine','SGDR','None'], help='learning rate policy: lambda|step|multi-step|plateau|cosine|SGDR')
+    parser.add_argument('--lr_decay_iters', type=int, default=10, help='multiply by a gamma every lr_decay_iters iterations')
+    parser.add_argument("--gamma",default=0.1,type=float,help='multiply by a gamma every lr_decay_iters iterations')
+    
+    
     # DDP configs:
     parser.add_argument('--world_size', default=-1, type=int, 
                         help='number of nodes for distributed training')
@@ -44,18 +57,25 @@ if __name__ == "__main__":
                         help='batch_size')
     
     args = parser.parse_args()
-    mode = PRETRAINING if args.mode == "pretraining" else FINE_TUNING
+    
 
-    config = Config(mode, args)
-   
+    config = Config(args)
+    
     
     meta_data = pd.read_csv(config.label)
-    subjects = os.listdir(config.data)
+    subjects = sorted(os.listdir(config.data))
     
     if config.label_name == 'sex':
         subj_meta = [(subj,meta_data[meta_data['eid']==int(subj[:7])]['sex'].values[0]) for subj in subjects]
     elif config.label_name == 'age':
         subj_meta = [(subj,meta_data[meta_data['eid']==int(subj[:7])]['age'].values[0]) for subj in subjects]
+    elif config.label_name == 'intelligence_gps':
+        meta_data = meta_data.dropna(subset=['SCORE_auto'])
+        subj_meta = [(subj,meta_data[meta_data['eid']==int(subj[:7])]['SCORE_auto'].values[0]) for subj in subjects if int(subj[:7]) in meta_data['eid'].tolist()] 
+        
+        #if int(subj[:7]) in meta_data['eid'].tolist()
+    
+    print(f'training {len(subj_meta)} UKB subjects')
         
     #subj_meta is a list consisting of tuple (filename, label(int))
     
@@ -68,7 +88,7 @@ if __name__ == "__main__":
     subj_train= subj_meta[:num_train]
     subj_val = subj_meta[num_train:]
     
-    if config.mode == PRETRAINING:
+    if config.mode == 'pretraining':
         if config.model == "DenseNet":
             net = densenet121(mode="encoder", drop_rate=0.0)
         elif config.model == "UNet":
@@ -148,7 +168,7 @@ if __name__ == "__main__":
             
     torch.backends.cudnn.benchmark = True        
     
-    if config.mode == mode:
+    if config.mode == 'pretraining':
         dataset_train = UKBDataset(config, subj_train) #MRIDataset(config, training=True)
         dataset_val = UKBDataset(config,subj_val)  #MRIDataset(config, validation=True)
     else:
@@ -178,7 +198,7 @@ if __name__ == "__main__":
                             pin_memory=config.pin_mem,
                             num_workers=config.num_cpu_workers
                             )
-    if config.mode == PRETRAINING:
+    if config.mode == 'pretraining':
         if config.framework == 'simclr':
             loss = NTXenLoss(temperature=config.temperature,return_logits=True)
         elif config.framework == 'yaware':
@@ -189,10 +209,10 @@ if __name__ == "__main__":
 
     elif config.mode == FINE_TUNING:
         loss = CrossEntropyLoss()
-
+    
     model = yAwareCLModel(net, loss, loader_train, loader_val, config)
 
-    if config.mode == PRETRAINING:
+    if config.mode == 'pretraining':
         if config.framework == 'simclr':
             model.pretraining_simclr()
         elif config.framework == 'yaware':
