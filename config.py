@@ -23,13 +23,12 @@ class Config:
             self.nb_epochs_per_saving = 1 # 몇 에포크에 한 번씩 저장할 것인가
             self.pin_mem = True
             self.num_cpu_workers = 8
-            self.nb_epochs = 100
             self.cuda = True
+            
             # Optimizer
-            self.lr = 1e-4
             self.weight_decay = 5e-5
+            
             # Hyperparameters for our y-Aware InfoNCE Loss
-            self.sigma = 5 # depends on the meta-data at hand
             self.temperature = 0.1
             
             self.model = "DenseNet"

@@ -23,25 +23,28 @@ from config import Config
 import pandas as pd
 import os
 import random
+from sklearn.preprocessing import MinMaxScaler
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["pretraining", "finetuning"], required=True,
                         help="Set the training mode. Do not forget to configure config.py accordingly !")
-    parser.add_argument("--framework", type=str, choices=["yaware", "simclr"], required=True,
-                        help="select which framework to use !")
+    parser.add_argument("--framework", type=str, choices=["yaware", "simclr"], required=True)
+    parser.add_argument("--kernel", type=str, default = 'rbf',choices=["rbf", "XOR"], help="rbf(continuous), XOR(binary categorical variable)")
     parser.add_argument("--ckpt_dir", type=str, default = './checkpoint',
                         help="select which dir to save the checkpoint!")
     parser.add_argument("--tb_dir", type=str, default = './tb',
                        help="select which dir to save the tensorboard log")
     parser.add_argument("--tf", type=str, default = 'all_tf',choices=['all_tf','cutout','crop'],
                        help="select which transforms to apply")
-    parser.add_argument("--label_name", type=str, default = 'age', choices= ['age', 'sex', 'intelligence_gps'], 
-                       help="select which dir to save the tensorboard log")
+    parser.add_argument("--nb_epochs", type=int, default = 100, help="number of epochs")
+    parser.add_argument("--lr", type=float, default = 1e-4, help="initial learning rate for optimizer")
+    parser.add_argument("--label_name", type=str, default = 'age', choices= ['age', 'sex', 'intelligence_gps', 'intelligence'], help="target meta info")
     parser.add_argument("--lr_policy",type=str,default='None' ,choices=['lambda','step','multi-step','plateau','cosine','SGDR','None'], help='learning rate policy: lambda|step|multi-step|plateau|cosine|SGDR')
     parser.add_argument('--lr_decay_iters', type=int, default=10, help='multiply by a gamma every lr_decay_iters iterations')
     parser.add_argument("--gamma",default=0.1,type=float,help='multiply by a gamma every lr_decay_iters iterations')
+    parser.add_argument("--sigma",default=5,type=float,help='Hyperparameters for our y-Aware InfoNCE Loss depending on the meta-data at hand')                    
     
     
     # DDP configs:
@@ -63,6 +66,9 @@ if __name__ == "__main__":
     
     
     meta_data = pd.read_csv(config.label)
+    
+    
+    
     subjects = sorted(os.listdir(config.data))
     
     if config.label_name == 'sex':
@@ -71,9 +77,28 @@ if __name__ == "__main__":
         subj_meta = [(subj,meta_data[meta_data['eid']==int(subj[:7])]['age'].values[0]) for subj in subjects]
     elif config.label_name == 'intelligence_gps':
         meta_data = meta_data.dropna(subset=['SCORE_auto'])
-        subj_meta = [(subj,meta_data[meta_data['eid']==int(subj[:7])]['SCORE_auto'].values[0]) for subj in subjects if int(subj[:7]) in meta_data['eid'].tolist()] 
+
+        #rescale to min & max of the age
+        age_min = meta_data['age'].min()
+        age_max = meta_data['age'].max()
+        scaler = MinMaxScaler((age_min,age_max))
+        meta_data['SCORE_auto'] = scaler.fit_transform(meta_data[['SCORE_auto']])
+        print(f'the values of intelligence_gps are min-max scaled to {age_min} ~ {age_max}')
+
+        subj_meta = [(subj,meta_data[meta_data['eid']==int(subj[:7])]['SCORE_auto'].values[0]) for subj in subjects if int(subj[:7]) in meta_data['eid'].tolist()]
+
+    elif config.label_name == 'intelligence':
+        meta_data = meta_data.dropna(subset=['fluid'])
+
+        #rescale to min & max of the age
+        age_min = meta_data['age'].min()
+        age_max = meta_data['age'].max()
+        scaler = MinMaxScaler((age_min,age_max))
+        meta_data['fluid'] = scaler.fit_transform(meta_data[['fluid']])
+        print(f'the values of intelligence are min-max scaled to {age_min} ~ {age_max}')
+
+        subj_meta = [(subj,meta_data[meta_data['eid']==int(subj[:7])]['fluid'].values[0]) for subj in subjects if int(subj[:7]) in meta_data['eid'].tolist()] 
         
-        #if int(subj[:7]) in meta_data['eid'].tolist()
     
     print(f'training {len(subj_meta)} UKB subjects')
         
@@ -202,8 +227,8 @@ if __name__ == "__main__":
         if config.framework == 'simclr':
             loss = NTXenLoss(temperature=config.temperature,return_logits=True)
         elif config.framework == 'yaware':
-            loss = GeneralizedSupervisedNTXenLoss(temperature=config.temperature,
-                                              kernel='rbf',
+            loss = GeneralizedSupervisedNTXenLoss(config = config, temperature=config.temperature,
+                                              kernel=config.kernel,
                                               sigma=config.sigma,
                                               return_logits=True)
 
